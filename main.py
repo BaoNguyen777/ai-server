@@ -1,7 +1,11 @@
 import os
 import re
-from contextlib import asynccontextmanager
 from typing import Any
+
+# Keep third-party model/config caches writable on Railway.
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+os.environ.setdefault("PADDLEX_HOME", "/tmp/paddlex")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import cv2
 import numpy as np
@@ -22,6 +26,7 @@ MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "15"))
 
 model: YOLO | None = None
 ocr = None
+ocr_init_error: str | None = None
 
 
 def auth(x_api_key: str | None = Header(default=None)):
@@ -29,27 +34,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model, ocr
-    model = YOLO(MODEL_PATH)
-    if PaddleOCR is not None:
-        try:
-            ocr = PaddleOCR(
-                lang="vi",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
-        except Exception as exc:
-            print(f"[WARN] PaddleOCR could not start: {exc}")
-            ocr = None
-    else:
-        print("[WARN] PaddleOCR is not installed. Detection will still work.")
-    yield
-
-
-app = FastAPI(title="Vietnam Plate AI Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Vietnam Plate AI Server", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,6 +42,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def startup():
+    global model
+    # YOLO is small enough to load during startup. PaddleOCR is intentionally
+    # lazy-loaded so /health can respond even while OCR models are downloading.
+    model = YOLO(MODEL_PATH)
+    print(f"[STARTUP] YOLO loaded: {MODEL_PATH}")
+
+
+def get_ocr():
+    global ocr, ocr_init_error
+
+    if ocr is not None:
+        return ocr
+    if PaddleOCR is None:
+        ocr_init_error = "PaddleOCR is not installed"
+        return None
+
+    try:
+        print("[OCR] Initializing lightweight PP-OCRv5 mobile models...")
+        ocr = PaddleOCR(
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="PP-OCRv5_mobile_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device="cpu",
+        )
+        print("[OCR] PaddleOCR ready")
+    except Exception as exc:
+        ocr_init_error = str(exc)
+        print(f"[WARN] PaddleOCR could not start: {exc}")
+        ocr = None
+
+    return ocr
 
 
 def read_image(data: bytes) -> np.ndarray:
@@ -100,10 +122,11 @@ def format_plate(raw: str) -> str:
 
 
 def run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
-    if ocr is None:
+    pipeline = get_ocr()
+    if pipeline is None:
         return [], []
 
-    result = ocr.predict(image)
+    result = pipeline.predict(image)
     texts: list[str] = []
     scores: list[float] = []
 
@@ -161,7 +184,9 @@ def extract_cccd(texts: list[str]) -> tuple[str, float]:
 
 
 def detect(image: np.ndarray) -> dict[str, Any]:
-    assert model is not None
+    if model is None:
+        raise HTTPException(status_code=503, detail="YOLO model is not loaded")
+
     results = model.predict(image, conf=CONF, imgsz=IMG_SIZE, verbose=False)
     result = results[0]
     boxes = result.boxes
@@ -213,7 +238,8 @@ def root():
         "service": "Vietnam Plate AI Server",
         "status": "ok",
         "model": MODEL_PATH,
-        "ocr": ocr is not None,
+        "model_loaded": model is not None,
+        "ocr_loaded": ocr is not None,
     }
 
 
@@ -223,6 +249,7 @@ def health():
         "status": "ok",
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
+        "ocr_init_error": ocr_init_error,
     }
 
 
