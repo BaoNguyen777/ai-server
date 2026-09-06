@@ -34,7 +34,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam Plate AI Server", version="1.1.0")
+app = FastAPI(title="Vietnam Plate AI Server", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,12 +62,14 @@ def get_ocr():
 
     try:
         print("[OCR] Initializing lightweight PP-OCRv5 mobile models...", flush=True)
+        print("[OCR] MKL-DNN disabled for CPU compatibility", flush=True)
         ocr = PaddleOCR(
             text_detection_model_name="PP-OCRv5_mobile_det",
             text_recognition_model_name="PP-OCRv5_mobile_rec",
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            enable_mkldnn=False,
             device="cpu",
         )
         print("[OCR] PaddleOCR ready", flush=True)
