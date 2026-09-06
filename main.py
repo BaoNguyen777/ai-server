@@ -1,8 +1,8 @@
 import os
 import re
+import traceback
 from typing import Any
 
-# Keep third-party model/config caches writable on Railway.
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 os.environ.setdefault("PADDLEX_HOME", "/tmp/paddlex")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -47,23 +47,21 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     global model
-    # YOLO is small enough to load during startup. PaddleOCR is intentionally
-    # lazy-loaded so /health can respond even while OCR models are downloading.
     model = YOLO(MODEL_PATH)
-    print(f"[STARTUP] YOLO loaded: {MODEL_PATH}")
+    print(f"[STARTUP] YOLO loaded: {MODEL_PATH}", flush=True)
 
 
 def get_ocr():
     global ocr, ocr_init_error
-
     if ocr is not None:
         return ocr
     if PaddleOCR is None:
         ocr_init_error = "PaddleOCR is not installed"
+        print("[OCR] PaddleOCR import is unavailable", flush=True)
         return None
 
     try:
-        print("[OCR] Initializing lightweight PP-OCRv5 mobile models...")
+        print("[OCR] Initializing lightweight PP-OCRv5 mobile models...", flush=True)
         ocr = PaddleOCR(
             text_detection_model_name="PP-OCRv5_mobile_det",
             text_recognition_model_name="PP-OCRv5_mobile_rec",
@@ -72,12 +70,12 @@ def get_ocr():
             use_textline_orientation=False,
             device="cpu",
         )
-        print("[OCR] PaddleOCR ready")
+        print("[OCR] PaddleOCR ready", flush=True)
     except Exception as exc:
-        ocr_init_error = str(exc)
-        print(f"[WARN] PaddleOCR could not start: {exc}")
+        ocr_init_error = f"{type(exc).__name__}: {exc}"
+        print(f"[OCR] initialization failed: {ocr_init_error}", flush=True)
+        traceback.print_exc()
         ocr = None
-
     return ocr
 
 
@@ -100,10 +98,7 @@ def normalize_text(text: str) -> str:
 
 def plate_candidates(texts: list[str]) -> list[str]:
     joined = re.sub(r"[^A-Z0-9]", "", "".join(texts).upper())
-    patterns = [
-        r"\d{2}[A-Z]{1,2}\d{4,5}",
-        r"\d{2}[A-Z]{1,2}\d{3}[A-Z]\d{1,2}",
-    ]
+    patterns = [r"\d{2}[A-Z]{1,2}\d{4,5}", r"\d{2}[A-Z]{1,2}\d{3}[A-Z]\d{1,2}"]
     candidates: list[str] = []
     for pattern in patterns:
         candidates.extend(re.findall(pattern, joined))
@@ -125,11 +120,11 @@ def run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
     pipeline = get_ocr()
     if pipeline is None:
         return [], []
-
+    print(f"[OCR] predict start shape={image.shape}", flush=True)
     result = pipeline.predict(image)
+    print("[OCR] predict complete", flush=True)
     texts: list[str] = []
     scores: list[float] = []
-
     for item in result:
         data: Any = getattr(item, "json", None)
         if callable(data):
@@ -139,16 +134,14 @@ def run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
                 data = item["res"]
             except Exception:
                 data = None
-
         if isinstance(data, dict) and "res" in data:
             data = data["res"]
-
         if isinstance(data, dict):
             for text, score in zip(data.get("rec_texts", []), data.get("rec_scores", [])):
                 if text:
                     texts.append(str(text))
                     scores.append(float(score))
-
+    print(f"[OCR] texts={texts}", flush=True)
     return texts, scores
 
 
@@ -187,30 +180,28 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     if model is None:
         raise HTTPException(status_code=503, detail="YOLO model is not loaded")
 
+    print("[DETECT] YOLO predict start", flush=True)
     results = model.predict(image, conf=CONF, imgsz=IMG_SIZE, verbose=False)
+    print("[DETECT] YOLO predict complete", flush=True)
     result = results[0]
     boxes = result.boxes
 
     if boxes is None or len(boxes) == 0:
+        print("[DETECT] no YOLO boxes; running full-image OCR", flush=True)
         texts, _ = run_ocr(image)
         cccd, cccd_conf = extract_cccd(texts)
-        return {
-            "licensePlate": "",
-            "cccd": cccd,
-            "confidence": 0,
-            "plateConfidence": 0,
-            "cccdConfidence": cccd_conf,
-            "detections": [],
-        }
+        return {"licensePlate": "", "cccd": cccd, "confidence": 0, "plateConfidence": 0, "cccdConfidence": cccd_conf, "detections": []}
 
     confs = boxes.conf.cpu().numpy().tolist()
     xyxy = boxes.xyxy.cpu().numpy().tolist()
     best_index = int(np.argmax(confs))
+    print(f"[DETECT] boxes={len(xyxy)} best_conf={confs[best_index]:.4f}", flush=True)
 
     texts, scores = run_ocr(preprocess_plate(crop_plate(image, xyxy[best_index])))
     candidates = plate_candidates(texts)
     raw_plate = candidates[0] if candidates else normalize_text("".join(texts))
     license_plate = format_plate(raw_plate)
+    print(f"[DETECT] plate={license_plate} candidates={candidates}", flush=True)
 
     all_texts, _ = run_ocr(image)
     cccd, cccd_conf = extract_cccd(all_texts)
@@ -234,30 +225,31 @@ def detect(image: np.ndarray) -> dict[str, Any]:
 
 @app.get("/")
 def root():
-    return {
-        "service": "Vietnam Plate AI Server",
-        "status": "ok",
-        "model": MODEL_PATH,
-        "model_loaded": model is not None,
-        "ocr_loaded": ocr is not None,
-    }
+    return {"service": "Vietnam Plate AI Server", "status": "ok", "model": MODEL_PATH, "model_loaded": model is not None, "ocr_loaded": ocr is not None}
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "ocr_loaded": ocr is not None,
-        "ocr_init_error": ocr_init_error,
-    }
+    return {"status": "ok", "model_loaded": model is not None, "ocr_loaded": ocr is not None, "ocr_init_error": ocr_init_error}
 
 
 @app.post("/recognize", dependencies=[Depends(auth)])
 async def recognize(file: UploadFile = File(...)):
-    data = await file.read()
-    image = read_image(data)
-    return detect(image)
+    print(f"[RECOGNIZE] request received filename={file.filename} content_type={file.content_type}", flush=True)
+    try:
+        data = await file.read()
+        print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
+        image = read_image(data)
+        print(f"[RECOGNIZE] image decoded shape={image.shape}", flush=True)
+        result = detect(image)
+        print("[RECOGNIZE] success", flush=True)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[RECOGNIZE] UNHANDLED {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Recognition failed: {type(exc).__name__}: {exc}") from exc
 
 
 @app.post("/recognize/batch", dependencies=[Depends(auth)])
