@@ -1,6 +1,7 @@
 import os
 import re
 import traceback
+import gc
 from typing import Any
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
@@ -23,6 +24,7 @@ API_KEY = os.getenv("AI_API_KEY", "")
 CONF = float(os.getenv("YOLO_CONF", "0.25"))
 IMG_SIZE = int(os.getenv("YOLO_IMGSZ", "960"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "15"))
+CCCD_OCR_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "640"))
 
 model: YOLO | None = None
 ocr = None
@@ -34,7 +36,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam Plate AI Server", version="1.1.1")
+app = FastAPI(title="Vietnam Plate AI Server", version="1.1.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -118,6 +120,18 @@ def format_plate(raw: str) -> str:
     return raw
 
 
+def resize_for_cccd_ocr(image: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    max_side = max(h, w)
+    if max_side <= CCCD_OCR_MAX_SIDE:
+        return image
+    scale = CCCD_OCR_MAX_SIDE / max_side
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    print(f"[OCR] resizing full image for CCCD OCR: {w}x{h} -> {new_w}x{new_h}", flush=True)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def run_ocr(image: np.ndarray) -> tuple[list[str], list[float]]:
     pipeline = get_ocr()
     if pipeline is None:
@@ -189,9 +203,12 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     boxes = result.boxes
 
     if boxes is None or len(boxes) == 0:
-        print("[DETECT] no YOLO boxes; running full-image OCR", flush=True)
-        texts, _ = run_ocr(image)
+        print("[DETECT] no YOLO boxes; running resized full-image OCR", flush=True)
+        small_image = resize_for_cccd_ocr(image)
+        texts, _ = run_ocr(small_image)
         cccd, cccd_conf = extract_cccd(texts)
+        del small_image
+        gc.collect()
         return {"licensePlate": "", "cccd": cccd, "confidence": 0, "plateConfidence": 0, "cccdConfidence": cccd_conf, "detections": []}
 
     confs = boxes.conf.cpu().numpy().tolist()
@@ -199,20 +216,31 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     best_index = int(np.argmax(confs))
     print(f"[DETECT] boxes={len(xyxy)} best_conf={confs[best_index]:.4f}", flush=True)
 
-    texts, scores = run_ocr(preprocess_plate(crop_plate(image, xyxy[best_index])))
+    plate_crop = preprocess_plate(crop_plate(image, xyxy[best_index]))
+    texts, scores = run_ocr(plate_crop)
     candidates = plate_candidates(texts)
     raw_plate = candidates[0] if candidates else normalize_text("".join(texts))
     license_plate = format_plate(raw_plate)
+    plate_confidence = float(np.mean(scores)) if scores else 0
     print(f"[DETECT] plate={license_plate} candidates={candidates}", flush=True)
 
-    all_texts, _ = run_ocr(image)
+    del plate_crop, texts, scores
+    gc.collect()
+
+    print("[DETECT] running resized full-image OCR for CCCD", flush=True)
+    small_image = resize_for_cccd_ocr(image)
+    all_texts, _ = run_ocr(small_image)
     cccd, cccd_conf = extract_cccd(all_texts)
+    print(f"[DETECT] cccd={cccd} confidence={cccd_conf}", flush=True)
+
+    del small_image, all_texts
+    gc.collect()
 
     return {
         "licensePlate": license_plate,
         "cccd": cccd,
         "confidence": float(confs[best_index]),
-        "plateConfidence": float(np.mean(scores)) if scores else 0,
+        "plateConfidence": plate_confidence,
         "cccdConfidence": cccd_conf,
         "detections": [
             {
