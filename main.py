@@ -2,6 +2,7 @@ import os
 import re
 import traceback
 import gc
+import ctypes
 from typing import Any
 
 # Railway/container memory safety: keep native ML runtimes conservative.
@@ -12,6 +13,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("PADDLE_NUM_THREADS", "1")
+os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
 
 import cv2
 import numpy as np
@@ -29,8 +31,7 @@ API_KEY = os.getenv("AI_API_KEY", "")
 CONF = float(os.getenv("YOLO_CONF", "0.25"))
 IMG_SIZE = int(os.getenv("YOLO_IMGSZ", "960"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "15"))
-CCCD_OCR_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "640"))
-# IMPORTANT: never send a huge 3x plate crop to PaddleOCR.
+CCCD_OCR_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "480"))
 PLATE_OCR_MAX_SIDE = int(os.getenv("PLATE_OCR_MAX_SIDE", "1280"))
 PLATE_SCALE = float(os.getenv("PLATE_OCR_SCALE", "2.0"))
 
@@ -44,7 +45,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam Plate AI Server", version="1.3.0")
+app = FastAPI(title="Vietnam Plate AI Server", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,6 +53,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def trim_native_memory():
+    """Ask glibc to return unused native heap pages after ML inference."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
 
 
 @app.on_event("startup")
@@ -88,8 +98,8 @@ def get_ocr():
             use_textline_orientation=False,
             enable_mkldnn=False,
             device="cpu",
-            # Keep Paddle's detector from creating very large intermediate tensors.
-            text_det_limit_side_len=960,
+            # Smaller detector limit lowers the peak RAM during the second OCR pass.
+            text_det_limit_side_len=640,
             text_det_limit_type="max",
         )
         print("[OCR] PaddleOCR ready", flush=True)
@@ -145,12 +155,10 @@ def correct_confusion_characters(raw: str) -> str:
         "S": "5", "B": "8", "G": "6", "Z": "2", "A": "4",
     }
 
-    # Vietnamese province code: first two characters should be digits.
     for i in range(min(2, n)):
         if chars[i].isalpha() and chars[i] in char_to_digit:
             chars[i] = char_to_digit[chars[i]]
 
-    # Numeric suffix: correct obvious OCR digit confusions from the right.
     for i in range(n - 1, 2, -1):
         if chars[i].isalpha():
             if chars[i] in char_to_digit:
@@ -213,9 +221,10 @@ def run_ocr(image: np.ndarray, label: str = "image") -> list[dict[str, Any]]:
     if pipeline is None or image is None or image.size == 0:
         return []
 
-    # Final safety cap. This is intentionally done immediately before PaddleOCR.
-    image_for_ocr = resize_max_side(image, PLATE_OCR_MAX_SIDE, label)
+    max_side = PLATE_OCR_MAX_SIDE if label == "plate" else CCCD_OCR_MAX_SIDE
+    image_for_ocr = resize_max_side(image, max_side, label)
     created_resized = image_for_ocr is not image
+    result = None
 
     try:
         print(f"[OCR] predict start shape={image_for_ocr.shape} label={label}", flush=True)
@@ -283,14 +292,11 @@ def run_ocr(image: np.ndarray, label: str = "image") -> list[dict[str, Any]]:
         )
         return items
     finally:
-        # Release Paddle's result iterator/reference as early as possible.
-        try:
-            del result
-        except Exception:
-            pass
+        result = None
         if created_resized:
             del image_for_ocr
         gc.collect()
+        trim_native_memory()
 
 
 def combine_ocr_items(items: list[dict[str, Any]]) -> tuple[str, float]:
@@ -352,7 +358,6 @@ def preprocess_plate(crop: np.ndarray) -> np.ndarray:
     if crop is None or crop.size == 0:
         return crop
 
-    # Upscale only when the crop is small; then cap the final dimensions.
     scale = max(1.0, PLATE_SCALE)
     processed = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     processed = resize_max_side(processed, PLATE_OCR_MAX_SIDE, "plate crop")
@@ -380,6 +385,7 @@ def recognize_plate_crop(crop: np.ndarray) -> tuple[str, float, list[str]]:
     finally:
         del processed
         gc.collect()
+        trim_native_memory()
 
 
 def extract_cccd(texts: list[dict[str, Any]]) -> tuple[str, float]:
@@ -410,6 +416,7 @@ def detect_cccd(image: np.ndarray) -> tuple[str, float]:
     finally:
         del small_image
         gc.collect()
+        trim_native_memory()
 
 
 def detect(image: np.ndarray) -> dict[str, Any]:
@@ -442,12 +449,10 @@ def detect(image: np.ndarray) -> dict[str, Any]:
                 "class": class_name,
             })
 
-        # Detach/copy the CPU arrays before releasing YOLO result tensors.
         xyxy = [list(map(float, box)) for box in xyxy]
 
     print(f"[DETECT] boxes={len(detections)}", flush=True)
 
-    # YOLO tensors are no longer needed after detections are copied.
     try:
         del boxes
         del result
@@ -455,6 +460,7 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     except Exception:
         pass
     gc.collect()
+    trim_native_memory()
 
     license_plate = ""
     plate_confidence = 0.0
@@ -467,8 +473,6 @@ def detect(image: np.ndarray) -> dict[str, Any]:
             reverse=True,
         )
 
-        # Only OCR the highest-confidence few detections. This prevents a
-        # multi-vehicle image from repeatedly allocating PaddleOCR tensors.
         max_plate_attempts = max(1, int(os.getenv("MAX_PLATE_OCR_ATTEMPTS", "2")))
         for attempt, (detection_info, original_index) in enumerate(ranked[:max_plate_attempts]):
             candidate_crop = crop_plate(image, xyxy[original_index])
@@ -482,6 +486,7 @@ def detect(image: np.ndarray) -> dict[str, Any]:
             finally:
                 del candidate_crop
                 gc.collect()
+                trim_native_memory()
 
         if license_plate:
             print(
@@ -491,7 +496,6 @@ def detect(image: np.ndarray) -> dict[str, Any]:
         else:
             print("[DETECT] no valid Vietnamese plate from YOLO crops", flush=True)
 
-    # CCCD OCR uses a separately downscaled image.
     cccd, cccd_confidence = detect_cccd(image)
 
     return {
@@ -509,7 +513,7 @@ def root():
     return {
         "service": "Vietnam Plate AI Server",
         "status": "ok",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "model": MODEL_PATH,
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
@@ -522,7 +526,8 @@ def health():
         "status": "ok",
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
-        "ocr_init_error": ocr_init_error,
+        "ocr_error": ocr_init_error,
+        "version": "1.4.0",
     }
 
 
@@ -532,52 +537,43 @@ async def recognize(file: UploadFile = File(...)):
         f"[RECOGNIZE] request received filename={file.filename} content_type={file.content_type}",
         flush=True,
     )
+    data = await file.read()
+    print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
 
-    data = b""
-    image = None
+    image = read_image(data)
+    del data
+    print(f"[RECOGNIZE] image decoded shape={image.shape}", flush=True)
+
     try:
-        data = await file.read()
-        print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
-        image = read_image(data)
-        print(f"[RECOGNIZE] image decoded shape={image.shape}", flush=True)
-        result = detect(image)
+        response = detect(image)
         print("[RECOGNIZE] success", flush=True)
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"[RECOGNIZE] UNHANDLED {type(exc).__name__}: {exc}", flush=True)
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Recognition failed: {type(exc).__name__}: {exc}",
-        ) from exc
+        return response
     finally:
-        del data
-        if image is not None:
-            del image
+        del image
         gc.collect()
+        trim_native_memory()
 
 
 @app.post("/recognize/batch", dependencies=[Depends(auth)])
 async def recognize_batch(files: list[UploadFile] = File(...)):
-    output = []
-
+    results: list[dict[str, Any]] = []
     for file in files:
-        data = b""
-        image = None
+        data = await file.read()
+        image = read_image(data)
+        del data
         try:
-            data = await file.read()
-            image = read_image(data)
-            output.append({"filename": file.filename, **detect(image)})
-        except HTTPException as exc:
-            output.append({"filename": file.filename, "error": exc.detail})
+            results.append({
+                "filename": file.filename,
+                "result": detect(image),
+            })
         except Exception as exc:
-            output.append({"filename": file.filename, "error": str(exc)})
+            results.append({
+                "filename": file.filename,
+                "error": str(exc),
+            })
         finally:
-            del data
-            if image is not None:
-                del image
+            del image
             gc.collect()
+            trim_native_memory()
 
-    return {"success": True, "results": output}
+    return {"results": results}
