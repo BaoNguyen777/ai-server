@@ -26,7 +26,8 @@ COPY main.py .
 # v1s is selected as the Railway-friendly variant; the model repository also
 # provides larger n/m/l/x variants when more RAM is available.
 RUN mkdir -p models && \
-    python -c "from urllib.request import urlretrieve; urlretrieve('https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1s.pt?download=true', 'models/license-plate-finetune-v1s.pt')"
+    python -c "from urllib.request import urlretrieve; urlretrieve('https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1s.pt?download=true', 'models/license-plate-finetune-v1s.pt')" && \
+    ln -s license-plate-finetune-v1s.pt models/best.pt
 
 EXPOSE 8000
 
