@@ -4,9 +4,14 @@ import traceback
 import gc
 from typing import Any
 
+# Railway/container memory safety: keep native ML runtimes conservative.
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 os.environ.setdefault("PADDLEX_HOME", "/tmp/paddlex")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("PADDLE_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
@@ -25,7 +30,9 @@ CONF = float(os.getenv("YOLO_CONF", "0.25"))
 IMG_SIZE = int(os.getenv("YOLO_IMGSZ", "960"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "15"))
 CCCD_OCR_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "640"))
-PLATE_SCALE = float(os.getenv("PLATE_OCR_SCALE", "3.0"))
+# IMPORTANT: never send a huge 3x plate crop to PaddleOCR.
+PLATE_OCR_MAX_SIDE = int(os.getenv("PLATE_OCR_MAX_SIDE", "1280"))
+PLATE_SCALE = float(os.getenv("PLATE_OCR_SCALE", "2.0"))
 
 model: YOLO | None = None
 ocr = None
@@ -37,7 +44,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam Plate AI Server", version="1.2.0")
+app = FastAPI(title="Vietnam Plate AI Server", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,10 +60,12 @@ def startup():
     model = YOLO(MODEL_PATH)
     print(f"[STARTUP] YOLO loaded: {MODEL_PATH}", flush=True)
     print(f"[STARTUP] YOLO conf={CONF} imgsz={IMG_SIZE}", flush=True)
+    print(f"[STARTUP] plate OCR max side={PLATE_OCR_MAX_SIDE} scale={PLATE_SCALE}", flush=True)
+    print(f"[STARTUP] CCCD OCR max side={CCCD_OCR_MAX_SIDE}", flush=True)
 
 
 def get_ocr():
-    """Lazy-load OCR so Railway can become healthy before OCR model download/load."""
+    """Lazy-load OCR so Railway can become healthy before model download/load."""
     global ocr, ocr_init_error
 
     if ocr is not None:
@@ -68,11 +77,8 @@ def get_ocr():
         return None
 
     try:
-        # The original Cuong project uses English OCR for alphanumeric plates.
-        # We keep the lighter PP-OCRv5 mobile models for Railway memory limits,
-        # while porting its important spatial sorting + correction pipeline below.
         print("[OCR] Initializing PP-OCRv5 mobile English/alphanumeric pipeline...", flush=True)
-        print("[OCR] MKL-DNN disabled for CPU compatibility", flush=True)
+        print("[OCR] CPU memory-safe mode", flush=True)
         ocr = PaddleOCR(
             lang="en",
             text_detection_model_name="PP-OCRv5_mobile_det",
@@ -82,6 +88,9 @@ def get_ocr():
             use_textline_orientation=False,
             enable_mkldnn=False,
             device="cpu",
+            # Keep Paddle's detector from creating very large intermediate tensors.
+            text_det_limit_side_len=960,
+            text_det_limit_type="max",
         )
         print("[OCR] PaddleOCR ready", flush=True)
     except Exception as exc:
@@ -104,36 +113,44 @@ def read_image(data: bytes) -> np.ndarray:
     return image
 
 
+def resize_max_side(image: np.ndarray, max_side: int, label: str) -> np.ndarray:
+    """Downscale an image before OCR to prevent CPU/RAM spikes."""
+    if image is None or image.size == 0:
+        return image
+
+    h, w = image.shape[:2]
+    current_max = max(h, w)
+    if current_max <= max_side:
+        return image
+
+    scale = max_side / current_max
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    print(f"[OCR] resizing {label}: {w}x{h} -> {new_w}x{new_h}", flush=True)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def clean_alnum(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(text).upper())
 
 
 def correct_confusion_characters(raw: str) -> str:
-    """Ported from the reference project: correct OCR confusions by position."""
     chars = list(clean_alnum(raw))
     n = len(chars)
     if n < 5:
         return "".join(chars)
 
     char_to_digit = {
-        "O": "0",
-        "D": "0",
-        "Q": "0",
-        "I": "1",
-        "L": "1",
-        "S": "5",
-        "B": "8",
-        "G": "6",
-        "Z": "2",
-        "A": "4",
+        "O": "0", "D": "0", "Q": "0", "I": "1", "L": "1",
+        "S": "5", "B": "8", "G": "6", "Z": "2", "A": "4",
     }
 
-    # Vietnamese province code: first 2 characters must be digits.
+    # Vietnamese province code: first two characters should be digits.
     for i in range(min(2, n)):
         if chars[i].isalpha() and chars[i] in char_to_digit:
             chars[i] = char_to_digit[chars[i]]
 
-    # Numeric suffix: scan from the end, correcting only obvious digit confusions.
+    # Numeric suffix: correct obvious OCR digit confusions from the right.
     for i in range(n - 1, 2, -1):
         if chars[i].isalpha():
             if chars[i] in char_to_digit:
@@ -145,10 +162,7 @@ def correct_confusion_characters(raw: str) -> str:
 
 
 def plate_candidates(text: str) -> list[str]:
-    """Return only strings matching Vietnamese plate structures."""
     raw = correct_confusion_characters(text)
-
-    # Standard Vietnamese plates commonly seen by this model.
     patterns = [
         r"\d{2}[A-Z]{1,2}\d{4,5}",
         r"\d{2}[A-Z]{1,2}\d[A-Z]\d{1,2}",
@@ -158,8 +172,6 @@ def plate_candidates(text: str) -> list[str]:
     for pattern in patterns:
         candidates.extend(re.findall(pattern, raw))
 
-    # Also search the uncorrected text so a legitimate series letter such as G
-    # is not accidentally changed before matching.
     original = clean_alnum(text)
     for pattern in patterns:
         candidates.extend(re.findall(pattern, original))
@@ -168,35 +180,15 @@ def plate_candidates(text: str) -> list[str]:
 
 
 def format_plate(raw: str) -> str:
-    """Format a validated raw Vietnamese plate, otherwise return empty."""
     raw = correct_confusion_characters(raw)
-
     match = re.fullmatch(r"(\d{2})([A-Z]{1,2})(\d{4,5})", raw)
     if not match:
         return ""
 
     city_code, series, numbers = match.groups()
-
     if len(numbers) == 5:
         numbers = f"{numbers[:3]}.{numbers[3:]}"
-
     return f"{city_code}{series}-{numbers}"
-
-
-def resize_for_cccd_ocr(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
-    max_side = max(h, w)
-    if max_side <= CCCD_OCR_MAX_SIDE:
-        return image
-
-    scale = CCCD_OCR_MAX_SIDE / max_side
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    print(
-        f"[OCR] resizing full image for CCCD OCR: {w}x{h} -> {new_w}x{new_h}",
-        flush=True,
-    )
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def _json_from_result(item: Any) -> Any:
@@ -216,77 +208,69 @@ def _json_from_result(item: Any) -> Any:
     return data
 
 
-def run_ocr(image: np.ndarray) -> list[dict[str, Any]]:
-    """Run PaddleOCR and preserve text coordinates, confidence and height."""
+def run_ocr(image: np.ndarray, label: str = "image") -> list[dict[str, Any]]:
     pipeline = get_ocr()
-    if pipeline is None:
+    if pipeline is None or image is None or image.size == 0:
         return []
 
-    print(f"[OCR] predict start shape={image.shape}", flush=True)
-    result = pipeline.predict(image)
-    print("[OCR] predict complete", flush=True)
+    # Final safety cap. This is intentionally done immediately before PaddleOCR.
+    image_for_ocr = resize_max_side(image, PLATE_OCR_MAX_SIDE, label)
+    created_resized = image_for_ocr is not image
 
-    items: list[dict[str, Any]] = []
+    try:
+        print(f"[OCR] predict start shape={image_for_ocr.shape} label={label}", flush=True)
+        result = pipeline.predict(image_for_ocr)
+        print("[OCR] predict complete", flush=True)
 
-    for item in result:
-        data = _json_from_result(item)
-        if not isinstance(data, dict):
-            continue
-
-        rec_texts = data.get("rec_texts", []) or []
-        rec_scores = data.get("rec_scores", []) or []
-        rec_polys = data.get("rec_polys", []) or data.get("dt_polys", []) or []
-
-        for i, text in enumerate(rec_texts):
-            if not text:
+        items: list[dict[str, Any]] = []
+        for item in result:
+            data = _json_from_result(item)
+            if not isinstance(data, dict):
                 continue
 
-            try:
-                score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
-            except Exception:
-                score = 0.0
+            rec_texts = data.get("rec_texts", []) or []
+            rec_scores = data.get("rec_scores", []) or []
+            rec_polys = data.get("rec_polys", []) or data.get("dt_polys", []) or []
 
-            box = rec_polys[i] if i < len(rec_polys) else None
-            if box is None:
-                # Without coordinates we can still use the text, but spatial
-                # sorting is intentionally skipped for that item.
-                items.append(
-                    {
-                        "cx": 0.0,
-                        "cy": float(i),
-                        "height": 1.0,
-                        "text": str(text),
-                        "confidence": score,
-                    }
-                )
-                continue
+            for i, text in enumerate(rec_texts):
+                if not text:
+                    continue
 
-            try:
-                points = np.asarray(box, dtype=float).reshape(-1, 2)
-                xs = points[:, 0]
-                ys = points[:, 1]
-                cx = float(xs.mean())
-                cy = float(ys.mean())
-                height = max(float(ys.max() - ys.min()), 1.0)
-            except Exception:
-                cx = 0.0
-                cy = float(i)
-                height = 1.0
+                try:
+                    score = float(rec_scores[i]) if i < len(rec_scores) else 0.0
+                except Exception:
+                    score = 0.0
 
-            items.append(
-                {
+                box = rec_polys[i] if i < len(rec_polys) else None
+                if box is None:
+                    items.append({
+                        "cx": 0.0, "cy": float(i), "height": 1.0,
+                        "text": str(text), "confidence": score,
+                    })
+                    continue
+
+                try:
+                    points = np.asarray(box, dtype=float).reshape(-1, 2)
+                    xs = points[:, 0]
+                    ys = points[:, 1]
+                    cx = float(xs.mean())
+                    cy = float(ys.mean())
+                    height = max(float(ys.max() - ys.min()), 1.0)
+                except Exception:
+                    cx = 0.0
+                    cy = float(i)
+                    height = 1.0
+
+                items.append({
                     "cx": cx,
                     "cy": cy,
                     "height": height,
                     "text": str(text),
                     "confidence": score,
-                }
-            )
+                })
 
-    print(
-        "[OCR] items="
-        + str(
-            [
+        print(
+            "[OCR] items=" + str([
                 {
                     "text": x["text"],
                     "confidence": round(x["confidence"], 3),
@@ -294,15 +278,22 @@ def run_ocr(image: np.ndarray) -> list[dict[str, Any]]:
                     "cy": round(x["cy"], 1),
                 }
                 for x in items
-            ]
-        ),
-        flush=True,
-    )
-    return items
+            ]),
+            flush=True,
+        )
+        return items
+    finally:
+        # Release Paddle's result iterator/reference as early as possible.
+        try:
+            del result
+        except Exception:
+            pass
+        if created_resized:
+            del image_for_ocr
+        gc.collect()
 
 
 def combine_ocr_items(items: list[dict[str, Any]]) -> tuple[str, float]:
-    """Port Cuong's Y-row then X-column ordering for 1-line/2-line plates."""
     if not items:
         return "", 0.0
 
@@ -325,7 +316,6 @@ def combine_ocr_items(items: list[dict[str, Any]]) -> tuple[str, float]:
 
     parts: list[str] = []
     confidences: list[float] = []
-
     for row in rows:
         row.sort(key=lambda x: x["cx"])
         parts.append("".join(str(x["text"]) for x in row))
@@ -338,9 +328,13 @@ def combine_ocr_items(items: list[dict[str, Any]]) -> tuple[str, float]:
 
 
 def crop_plate(image: np.ndarray, box: list[float]) -> np.ndarray:
-    """Same small-margin crop strategy as the reference detector."""
     h, w = image.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in box]
+
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(x1 + 1, min(x2, w))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(y1 + 1, min(y2, h))
 
     margin_x = int((x2 - x1) * 0.05)
     margin_y = int((y2 - y1) * 0.05)
@@ -355,43 +349,41 @@ def crop_plate(image: np.ndarray, box: list[float]) -> np.ndarray:
 
 
 def preprocess_plate(crop: np.ndarray) -> np.ndarray:
-    """Upscale plate while keeping the crop visually close to the reference pipeline."""
     if crop is None or crop.size == 0:
         return crop
 
+    # Upscale only when the crop is small; then cap the final dimensions.
     scale = max(1.0, PLATE_SCALE)
-    crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    # Mild enhancement only. The reference project feeds the crop directly to
-    # OCR; avoid aggressive filtering that can distort characters.
-    return crop
+    processed = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    processed = resize_max_side(processed, PLATE_OCR_MAX_SIDE, "plate crop")
+    return processed
 
 
 def recognize_plate_crop(crop: np.ndarray) -> tuple[str, float, list[str]]:
     processed = preprocess_plate(crop)
-    items = run_ocr(processed)
-    combined, ocr_conf = combine_ocr_items(items)
+    try:
+        items = run_ocr(processed, "plate")
+        combined, ocr_conf = combine_ocr_items(items)
+        candidates = plate_candidates(combined)
 
-    candidates = plate_candidates(combined)
-    if not candidates:
-        print(f"[PLATE] rejected OCR='{combined}'", flush=True)
-        return "", 0.0, []
+        if not candidates:
+            print(f"[PLATE] rejected OCR='{combined}'", flush=True)
+            return "", 0.0, []
 
-    # Prefer the candidate with the highest structural confidence. The first
-    # match is kept deterministic, matching the reference behavior.
-    raw = candidates[0]
-    formatted = format_plate(raw)
-    print(
-        f"[PLATE] raw={raw} formatted={formatted} ocr_conf={ocr_conf:.4f} candidates={candidates}",
-        flush=True,
-    )
-    return formatted, ocr_conf, candidates
+        raw = candidates[0]
+        formatted = format_plate(raw)
+        print(
+            f"[PLATE] raw={raw} formatted={formatted} ocr_conf={ocr_conf:.4f} candidates={candidates}",
+            flush=True,
+        )
+        return formatted, ocr_conf, candidates
+    finally:
+        del processed
+        gc.collect()
 
 
 def extract_cccd(texts: list[dict[str, Any]]) -> tuple[str, float]:
-    """Find a 12-digit CCCD candidate from OCR text blocks."""
     candidates: list[tuple[str, float]] = []
-
     for item in texts:
         text = str(item.get("text", ""))
         score = float(item.get("confidence", 0.0))
@@ -401,18 +393,17 @@ def extract_cccd(texts: list[dict[str, Any]]) -> tuple[str, float]:
             candidates.append((digits, max(0.9, score)))
         elif len(digits) > 12:
             for i in range(len(digits) - 11):
-                candidates.append((digits[i : i + 12], max(0.75, score)))
+                candidates.append((digits[i:i + 12], max(0.75, score)))
 
     if not candidates:
         return "", 0.0
-
     return max(candidates, key=lambda x: x[1])
 
 
 def detect_cccd(image: np.ndarray) -> tuple[str, float]:
-    small_image = resize_for_cccd_ocr(image)
+    small_image = resize_max_side(image, CCCD_OCR_MAX_SIDE, "full image for CCCD")
     try:
-        items = run_ocr(small_image)
+        items = run_ocr(small_image, "CCCD")
         cccd, confidence = extract_cccd(items)
         print(f"[CCCD] value={cccd} confidence={confidence:.4f}", flush=True)
         return cccd, confidence
@@ -431,8 +422,9 @@ def detect(image: np.ndarray) -> dict[str, Any]:
 
     result = results[0]
     boxes = result.boxes
-
     detections: list[dict[str, Any]] = []
+    xyxy: list[list[float]] = []
+
     if boxes is not None and len(boxes) > 0:
         confs = boxes.conf.cpu().numpy().tolist()
         xyxy = boxes.xyxy.cpu().numpy().tolist()
@@ -444,22 +436,30 @@ def detect(image: np.ndarray) -> dict[str, Any]:
                 if hasattr(result, "names") and isinstance(result.names, dict)
                 else str(cls)
             )
-            detections.append(
-                {
-                    "box": [round(float(v), 2) for v in box],
-                    "confidence": round(float(conf), 4),
-                    "class": class_name,
-                }
-            )
+            detections.append({
+                "box": [round(float(v), 2) for v in box],
+                "confidence": round(float(conf), 4),
+                "class": class_name,
+            })
+
+        # Detach/copy the CPU arrays before releasing YOLO result tensors.
+        xyxy = [list(map(float, box)) for box in xyxy]
 
     print(f"[DETECT] boxes={len(detections)}", flush=True)
+
+    # YOLO tensors are no longer needed after detections are copied.
+    try:
+        del boxes
+        del result
+        del results
+    except Exception:
+        pass
+    gc.collect()
 
     license_plate = ""
     plate_confidence = 0.0
     best_yolo_confidence = 0.0
 
-    # Run the Cuong-style crop -> OCR -> spatial ordering for every detection,
-    # then keep the strongest valid plate instead of blindly using box #1.
     if detections:
         ranked = sorted(
             zip(detections, range(len(detections))),
@@ -467,20 +467,21 @@ def detect(image: np.ndarray) -> dict[str, Any]:
             reverse=True,
         )
 
-        # Usually there is one plate. Trying all detections makes the API robust
-        # when an image contains more than one vehicle/plate.
-        for detection_info, original_index in ranked:
+        # Only OCR the highest-confidence few detections. This prevents a
+        # multi-vehicle image from repeatedly allocating PaddleOCR tensors.
+        max_plate_attempts = max(1, int(os.getenv("MAX_PLATE_OCR_ATTEMPTS", "2")))
+        for attempt, (detection_info, original_index) in enumerate(ranked[:max_plate_attempts]):
             candidate_crop = crop_plate(image, xyxy[original_index])
-            candidate_plate, candidate_ocr_conf, candidates = recognize_plate_crop(candidate_crop)
-
-            if candidate_plate:
-                license_plate = candidate_plate
-                plate_confidence = candidate_ocr_conf
-                best_yolo_confidence = float(detection_info["confidence"])
-                break
-
-            del candidate_crop
-            gc.collect()
+            try:
+                candidate_plate, candidate_ocr_conf, _ = recognize_plate_crop(candidate_crop)
+                if candidate_plate:
+                    license_plate = candidate_plate
+                    plate_confidence = candidate_ocr_conf
+                    best_yolo_confidence = float(detection_info["confidence"])
+                    break
+            finally:
+                del candidate_crop
+                gc.collect()
 
         if license_plate:
             print(
@@ -490,8 +491,7 @@ def detect(image: np.ndarray) -> dict[str, Any]:
         else:
             print("[DETECT] no valid Vietnamese plate from YOLO crops", flush=True)
 
-    # Keep CCCD recognition independent from the plate text. It is intentionally
-    # run on a downscaled full image to avoid the previous Railway OOM.
+    # CCCD OCR uses a separately downscaled image.
     cccd, cccd_confidence = detect_cccd(image)
 
     return {
@@ -509,7 +509,7 @@ def root():
     return {
         "service": "Vietnam Plate AI Server",
         "status": "ok",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "model": MODEL_PATH,
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
@@ -533,6 +533,8 @@ async def recognize(file: UploadFile = File(...)):
         flush=True,
     )
 
+    data = b""
+    image = None
     try:
         data = await file.read()
         print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
@@ -550,6 +552,11 @@ async def recognize(file: UploadFile = File(...)):
             status_code=500,
             detail=f"Recognition failed: {type(exc).__name__}: {exc}",
         ) from exc
+    finally:
+        del data
+        if image is not None:
+            del image
+        gc.collect()
 
 
 @app.post("/recognize/batch", dependencies=[Depends(auth)])
@@ -557,6 +564,8 @@ async def recognize_batch(files: list[UploadFile] = File(...)):
     output = []
 
     for file in files:
+        data = b""
+        image = None
         try:
             data = await file.read()
             image = read_image(data)
@@ -565,5 +574,10 @@ async def recognize_batch(files: list[UploadFile] = File(...)):
             output.append({"filename": file.filename, "error": exc.detail})
         except Exception as exc:
             output.append({"filename": file.filename, "error": str(exc)})
+        finally:
+            del data
+            if image is not None:
+                del image
+            gc.collect()
 
     return {"success": True, "results": output}
