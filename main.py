@@ -44,7 +44,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam License Plate AI Server", version="1.5.0")
+app = FastAPI(title="Vietnam License Plate AI Server", version="1.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -152,12 +152,10 @@ def correct_confusion_characters(raw: str) -> str:
         "S": "5", "B": "8", "G": "6", "Z": "2",
     }
 
-    # Province code: first two characters must be digits.
     for i in range(min(2, n)):
         if chars[i].isalpha() and chars[i] in char_to_digit:
             chars[i] = char_to_digit[chars[i]]
 
-    # Registration number: characters after the series are normally digits.
     for i in range(n - 1, 2, -1):
         if chars[i].isalpha():
             if chars[i] in char_to_digit:
@@ -188,13 +186,7 @@ def plate_candidates(text: str) -> list[str]:
 
 
 def motorcycle_candidates(rows: list[str]) -> list[str]:
-    """Parse Vietnamese motorcycle plates that are printed on two rows.
-
-    Example:
-        95-U1
-        0615
-        -> 95U10615
-    """
+    """Parse Vietnamese motorcycle plates that are printed on two rows."""
     if len(rows) < 2:
         return []
 
@@ -204,17 +196,14 @@ def motorcycle_candidates(rows: list[str]) -> list[str]:
 
     candidates: list[str] = []
 
-    # Try every adjacent pair so OCR can return an extra small text fragment.
     for i in range(len(normalized) - 1):
         top = correct_confusion_characters(normalized[i])
         bottom = correct_confusion_characters(normalized[i + 1])
 
-        # Common Vietnamese motorcycle format: 2 digits + letter + digit + 4/5 digits.
         if re.fullmatch(r"\d{2}[A-Z]\d", top) and re.fullmatch(r"\d{4,5}", bottom):
             candidates.append(top + bottom)
             continue
 
-        # Some OCR splits the top row into 95 and U1.
         if re.fullmatch(r"\d{2}", top) and re.fullmatch(r"[A-Z]\d", bottom):
             if i + 2 < len(normalized):
                 number = correct_confusion_characters(normalized[i + 2])
@@ -298,13 +287,7 @@ def run_ocr(image: np.ndarray, label: str = "plate") -> list[dict[str, Any]]:
 
                 box = rec_polys[i] if i < len(rec_polys) else None
                 if box is None:
-                    items.append({
-                        "cx": 0.0,
-                        "cy": float(i),
-                        "height": 1.0,
-                        "text": str(text),
-                        "confidence": score,
-                    })
+                    items.append({"cx": 0.0, "cy": float(i), "height": 1.0, "text": str(text), "confidence": score})
                     continue
 
                 try:
@@ -319,26 +302,9 @@ def run_ocr(image: np.ndarray, label: str = "plate") -> list[dict[str, Any]]:
                     cy = float(i)
                     height = 1.0
 
-                items.append({
-                    "cx": cx,
-                    "cy": cy,
-                    "height": height,
-                    "text": str(text),
-                    "confidence": score,
-                })
+                items.append({"cx": cx, "cy": cy, "height": height, "text": str(text), "confidence": score})
 
-        print(
-            "[OCR] items=" + str([
-                {
-                    "text": x["text"],
-                    "confidence": round(x["confidence"], 3),
-                    "cx": round(x["cx"], 1),
-                    "cy": round(x["cy"], 1),
-                }
-                for x in items
-            ]),
-            flush=True,
-        )
+        print("[OCR] items=" + str([{"text": x["text"], "confidence": round(x["confidence"], 3), "cx": round(x["cx"], 1), "cy": round(x["cy"], 1)} for x in items]), flush=True)
         return items
     finally:
         result = None
@@ -349,7 +315,6 @@ def run_ocr(image: np.ndarray, label: str = "plate") -> list[dict[str, Any]]:
 
 
 def group_ocr_rows(items: list[dict[str, Any]]) -> tuple[list[str], float]:
-    """Group OCR boxes into visual rows; important for motorcycle plates."""
     if not items:
         return [], 0.0
 
@@ -398,8 +363,6 @@ def crop_plate(image: np.ndarray, box: list[float]) -> np.ndarray:
     crop_h = y2 - y1
     aspect = crop_w / max(crop_h, 1)
 
-    # Motorcycle plates are close to square/vertical and need a little more
-    # vertical context so the top and bottom rows survive the crop.
     if aspect < 1.8:
         margin_x = int(crop_w * 0.08)
         margin_y = int(crop_h * 0.14)
@@ -423,9 +386,6 @@ def preprocess_plate(crop: np.ndarray) -> np.ndarray:
     h, w = crop.shape[:2]
     aspect = w / max(h, 1)
     scale = max(1.0, PLATE_SCALE)
-
-    # Keep the same single OCR pass, but use a stronger resize for motorcycle
-    # crops where characters are usually smaller and arranged on two rows.
     interpolation = cv2.INTER_CUBIC if aspect < 1.8 else cv2.INTER_LINEAR
     processed = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interpolation)
     processed = resize_max_side(processed, PLATE_OCR_MAX_SIDE, "plate crop")
@@ -441,16 +401,11 @@ def recognize_plate_crop(crop: np.ndarray) -> tuple[str, float, list[str]]:
             print("[PLATE] rejected: OCR returned no rows", flush=True)
             return "", 0.0, []
 
-        # Motorcycle is detected from the spatial two-row layout first.
         motorcycle = motorcycle_candidates(rows)
         if motorcycle:
             raw = motorcycle[0]
             formatted = format_plate(raw, motorcycle=True)
-            print(
-                f"[PLATE] motorcycle raw={raw} formatted={formatted} "
-                f"ocr_conf={ocr_conf:.4f} rows={rows}",
-                flush=True,
-            )
+            print(f"[PLATE] motorcycle raw={raw} formatted={formatted} ocr_conf={ocr_conf:.4f} rows={rows}", flush=True)
             return formatted, ocr_conf, motorcycle
 
         combined = "".join(rows)
@@ -461,11 +416,7 @@ def recognize_plate_crop(crop: np.ndarray) -> tuple[str, float, list[str]]:
 
         raw = candidates[0]
         formatted = format_plate(raw)
-        print(
-            f"[PLATE] raw={raw} formatted={formatted} ocr_conf={ocr_conf:.4f} "
-            f"rows={rows} candidates={candidates}",
-            flush=True,
-        )
+        print(f"[PLATE] raw={raw} formatted={formatted} ocr_conf={ocr_conf:.4f} rows={rows} candidates={candidates}", flush=True)
         return formatted, ocr_conf, candidates
     finally:
         del processed
@@ -516,7 +467,8 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     gc.collect()
     trim_native_memory()
 
-    license_plate = ""
+    # IMPORTANT: never invent/fallback to a number. No valid OCR => null.
+    license_plate: str | None = None
     plate_confidence = 0.0
     best_yolo_confidence = 0.0
 
@@ -529,16 +481,12 @@ def detect(image: np.ndarray) -> dict[str, Any]:
 
         max_plate_attempts = max(1, int(os.getenv("MAX_PLATE_OCR_ATTEMPTS", "2")))
         for attempt, (detection_info, original_index) in enumerate(ranked[:max_plate_attempts]):
-            print(
-                f"[DETECT] OCR attempt={attempt + 1}/{max_plate_attempts} "
-                f"yolo_conf={detection_info['confidence']}",
-                flush=True,
-            )
+            print(f"[DETECT] OCR attempt={attempt + 1}/{max_plate_attempts} yolo_conf={detection_info['confidence']}", flush=True)
             candidate_crop = crop_plate(image, xyxy[original_index])
             try:
                 candidate_plate, candidate_ocr_conf, _ = recognize_plate_crop(candidate_crop)
-                if candidate_plate:
-                    license_plate = candidate_plate
+                if candidate_plate and candidate_plate.strip():
+                    license_plate = candidate_plate.strip()
                     plate_confidence = candidate_ocr_conf
                     best_yolo_confidence = float(detection_info["confidence"])
                     break
@@ -548,15 +496,12 @@ def detect(image: np.ndarray) -> dict[str, Any]:
                 trim_native_memory()
 
         if license_plate:
-            print(
-                f"[DETECT] valid plate={license_plate} "
-                f"yolo_conf={best_yolo_confidence:.4f}",
-                flush=True,
-            )
+            print(f"[DETECT] valid plate={license_plate} yolo_conf={best_yolo_confidence:.4f}", flush=True)
         else:
             print("[DETECT] no valid Vietnamese plate from YOLO crops", flush=True)
 
     return {
+        "success": license_plate is not None,
         "licensePlate": license_plate,
         "confidence": best_yolo_confidence,
         "plateConfidence": plate_confidence,
@@ -569,7 +514,7 @@ def root():
     return {
         "service": "Vietnam License Plate AI Server",
         "status": "ok",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "model": MODEL_PATH,
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
@@ -583,16 +528,13 @@ def health():
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
         "ocr_error": ocr_init_error,
-        "version": "1.5.0",
+        "version": "1.6.0",
     }
 
 
 @app.post("/recognize", dependencies=[Depends(auth)])
 async def recognize(file: UploadFile = File(...)):
-    print(
-        f"[RECOGNIZE] request received filename={file.filename} content_type={file.content_type}",
-        flush=True,
-    )
+    print(f"[RECOGNIZE] request received filename={file.filename} content_type={file.content_type}", flush=True)
     data = await file.read()
     print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
 
