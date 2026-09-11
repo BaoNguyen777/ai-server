@@ -21,6 +21,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY main.py .
+COPY api.py .
 
 # MorseTechLab YOLOv11 license-plate detector (v1s, 37.8 MB).
 # v1s is selected as the Railway-friendly variant; the model repository also
@@ -31,4 +32,4 @@ RUN mkdir -p models && \
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}"]
