@@ -44,7 +44,7 @@ def auth(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="Vietnam License Plate AI Server", version="1.6.0")
+app = FastAPI(title="Vietnam License Plate AI Server", version="1.6.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,8 +96,15 @@ def get_ocr():
             use_textline_orientation=False,
             enable_mkldnn=False,
             device="cpu",
-            text_det_limit_side_len=640,
-            text_det_limit_type="max",
+            # License plates contain very small characters. Lowering the
+            # detector thresholds lets PP-OCRv5 keep weak character strokes.
+            text_det_thresh=float(os.getenv("OCR_DET_THRESH", "0.18")),
+            text_det_box_thresh=float(os.getenv("OCR_BOX_THRESH", "0.35")),
+            text_det_unclip_ratio=float(os.getenv("OCR_UNCLIP_RATIO", "2.2")),
+            # Use a larger detector canvas for the small character crop.
+            text_det_limit_side_len=int(os.getenv("OCR_DET_SIDE", "960")),
+            text_det_limit_type="min",
+            device_id=0 if False else None,
         )
         print("[OCR] PaddleOCR ready", flush=True)
     except Exception as exc:
@@ -467,7 +474,6 @@ def detect(image: np.ndarray) -> dict[str, Any]:
     gc.collect()
     trim_native_memory()
 
-    # IMPORTANT: never invent/fallback to a number. No valid OCR => null.
     license_plate: str | None = None
     plate_confidence = 0.0
     best_yolo_confidence = 0.0
@@ -514,64 +520,8 @@ def root():
     return {
         "service": "Vietnam License Plate AI Server",
         "status": "ok",
-        "version": "1.6.0",
+        "version": "1.6.1",
         "model": MODEL_PATH,
         "model_loaded": model is not None,
         "ocr_loaded": ocr is not None,
     }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "ocr_loaded": ocr is not None,
-        "ocr_error": ocr_init_error,
-        "version": "1.6.0",
-    }
-
-
-@app.post("/recognize", dependencies=[Depends(auth)])
-async def recognize(file: UploadFile = File(...)):
-    print(f"[RECOGNIZE] request received filename={file.filename} content_type={file.content_type}", flush=True)
-    data = await file.read()
-    print(f"[RECOGNIZE] file read bytes={len(data)}", flush=True)
-
-    image = read_image(data)
-    del data
-    print(f"[RECOGNIZE] image decoded shape={image.shape}", flush=True)
-
-    try:
-        response = detect(image)
-        print("[RECOGNIZE] success", flush=True)
-        return response
-    finally:
-        del image
-        gc.collect()
-        trim_native_memory()
-
-
-@app.post("/recognize/batch", dependencies=[Depends(auth)])
-async def recognize_batch(files: list[UploadFile] = File(...)):
-    results: list[dict[str, Any]] = []
-    for file in files:
-        data = await file.read()
-        image = read_image(data)
-        del data
-        try:
-            results.append({
-                "filename": file.filename,
-                "result": detect(image),
-            })
-        except Exception as exc:
-            results.append({
-                "filename": file.filename,
-                "error": str(exc),
-            })
-        finally:
-            del image
-            gc.collect()
-            trim_native_memory()
-
-    return {"results": results}
