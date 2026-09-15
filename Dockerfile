@@ -32,4 +32,6 @@ RUN mkdir -p models && \
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# IMPORTANT: keep exactly one worker. Each worker would load its own
+# YOLO/PaddleOCR runtime and multiply RAM usage on a small Railway service.
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
