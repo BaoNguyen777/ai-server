@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 from fastapi import Depends, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 import main as main_module
 from main import (
@@ -24,6 +25,7 @@ from main import (
 # otherwise be killed when PaddleOCR and YOLO are resident at the same time.
 CCCD_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "1200"))
 _model_lock = threading.Lock()
+_inference_lock = threading.Lock()
 _original_detect = main_module.detect
 
 try:
@@ -31,6 +33,36 @@ try:
         app.router.on_startup.remove(main_module.startup)
 except Exception as exc:
     print(f"[MEMORY] could not remove eager YOLO startup: {exc}", flush=True)
+
+
+@app.middleware("http")
+async def ai_concurrency_guard(request, call_next):
+    """Allow only one /api/ai inference per process.
+
+    Railway can send several uploads at once. YOLO + PaddleOCR are memory-heavy,
+    so queuing several inference requests is unsafe on a small container. Return
+    429 immediately instead; Web1 can retry the image instead of causing an OOM.
+    """
+    if request.url.path != "/api/ai":
+        return await call_next(request)
+
+    if not _inference_lock.acquire(blocking=False):
+        print("[CONCURRENCY] /api/ai busy -> 429", flush=True)
+        return JSONResponse(
+            status_code=429,
+            content={
+                "success": False,
+                "error": "AI server is busy; retry this image shortly",
+                "retryAfter": 2,
+            },
+            headers={"Retry-After": "2"},
+        )
+
+    try:
+        return await call_next(request)
+    finally:
+        _inference_lock.release()
+        print("[CONCURRENCY] /api/ai slot released", flush=True)
 
 
 def _ensure_yolo():
