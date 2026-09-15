@@ -193,6 +193,13 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
                 "motorcycleShape": aspect < 1.9,
             })
 
+    # YOLO coordinates belong to the resized detection image. Keep them for
+    # diagnostics, but map the selected box back to the original image before OCR.
+    original_h, original_w = image.shape[:2]
+    detect_h, detect_w = detect_image.shape[:2]
+    scale_x = original_w / max(detect_w, 1)
+    scale_y = original_h / max(detect_h, 1)
+
     del boxes, result, results, model
     if detect_image is not image:
         del detect_image
@@ -218,6 +225,25 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
 
     print(
         f"[DETECT+] OCR attempt=1/1 conf={detection['confidence']} aspect={detection['aspect']}",
+        flush=True,
+    )
+
+    detect_box = detection["box"]
+    original_box = [
+        detect_box[0] * scale_x,
+        detect_box[1] * scale_y,
+        detect_box[2] * scale_x,
+        detect_box[3] * scale_y,
+    ]
+    detection["detectBox"] = detection["box"]
+    detection["box"] = [round(v, 2) for v in original_box]
+
+    detect_width = max(detect_box[2] - detect_box[0], 1.0)
+    detect_height = max(detect_box[3] - detect_box[1], 1.0)
+    original_width = max(original_box[2] - original_box[0], 1.0)
+    original_height = max(original_box[3] - original_box[1], 1.0)
+    print(
+        f"[DETECT+] bbox mapped {detect_width:.0f}x{detect_height:.0f} -> {original_width:.0f}x{original_height:.0f}",
         flush=True,
     )
 
