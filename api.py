@@ -18,6 +18,7 @@ _model_lock = threading.Lock()
 _inference_lock = threading.Lock()
 _original_detect = main_module.detect
 _original_plate_candidates = main_module.plate_candidates
+_original_recognize_plate_crop = main_module.recognize_plate_crop
 
 try:
     if main_module.startup in app.router.on_startup:
@@ -147,10 +148,53 @@ def _resize_plate_crop_memory_safe(crop: np.ndarray) -> np.ndarray:
     return crop
 
 
+def _ocr_fallback_variants(crop: np.ndarray) -> list[np.ndarray]:
+    """Create small, sequential OCR fallbacks without keeping multiple large images."""
+    import cv2
+
+    if crop is None or crop.size == 0:
+        return []
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Mild unsharp mask preserves plate strokes better than hard thresholding.
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    variant = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+    # A second binary variant is useful when the plate has low contrast.
+    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    return [variant, binary_bgr]
+
+
 def _safe_recognize_plate_crop(crop: np.ndarray):
     safe_crop = _resize_plate_crop_memory_safe(crop)
     try:
-        return main_module.recognize_plate_crop(safe_crop)
+        plate, ocr_conf, parsed = _original_recognize_plate_crop(safe_crop)
+        if plate:
+            return plate, ocr_conf, parsed
+
+        # PP-OCRv5 sometimes detects no text on a low-contrast/small plate crop.
+        # Retry sequentially with contrast/sharpening variants while keeping only
+        # one fallback image alive at a time.
+        print("[OCR] primary pass returned no plate; trying enhanced fallback", flush=True)
+        for index, variant in enumerate(_ocr_fallback_variants(safe_crop), start=1):
+            try:
+                print(f"[OCR] fallback pass={index}/2", flush=True)
+                plate, ocr_conf, parsed = _original_recognize_plate_crop(variant)
+                if plate:
+                    print(f"[OCR] fallback pass={index} recognized plate={plate}", flush=True)
+                    return plate, ocr_conf, parsed
+            finally:
+                del variant
+                gc.collect()
+                trim_native_memory()
+
+        return "", 0.0, []
     finally:
         if safe_crop is not crop:
             del safe_crop
