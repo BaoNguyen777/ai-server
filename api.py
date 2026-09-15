@@ -1,15 +1,17 @@
+import os
 import re
 import gc
+import threading
 from typing import Any
 
 import cv2
 import numpy as np
 from fastapi import Depends, File, HTTPException, UploadFile
 
+import main as main_module
 from main import (
     app,
     auth,
-    detect,
     get_ocr,
     read_image,
     resize_max_side,
@@ -17,7 +19,39 @@ from main import (
     trim_native_memory,
 )
 
-CCCD_MAX_SIDE = int(__import__('os').getenv('CCCD_OCR_MAX_SIDE', '1600'))
+CCCD_MAX_SIDE = int(os.getenv('CCCD_OCR_MAX_SIDE', '1600'))
+_model_lock = threading.Lock()
+
+# IMPORTANT: main.py used to load YOLO during startup. That made Railway
+# load YOLO before a request even arrived, while PaddleOCR was also imported.
+# Remove that eager startup handler and load YOLO only for plate requests.
+try:
+    if main_module.startup in app.router.on_startup:
+        app.router.on_startup.remove(main_module.startup)
+except Exception as exc:
+    print(f'[MEMORY] could not remove eager YOLO startup: {exc}', flush=True)
+
+
+def _ensure_yolo():
+    if main_module.model is not None:
+        return main_module.model
+
+    with _model_lock:
+        if main_module.model is None:
+            from ultralytics import YOLO
+            print(f'[YOLO] lazy loading model: {main_module.MODEL_PATH}', flush=True)
+            main_module.model = YOLO(main_module.MODEL_PATH)
+            print('[YOLO] lazy model ready', flush=True)
+    return main_module.model
+
+
+def _lazy_detect(image: np.ndarray) -> dict[str, Any]:
+    _ensure_yolo()
+    return main_module.detect(image)
+
+# Existing /recognize and /recognize/batch routes in main.py resolve detect
+# through main's globals, so replacing the module reference preserves them.
+main_module.detect = _lazy_detect
 
 
 def _clean_text(value: Any) -> str:
@@ -70,7 +104,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
         raw_text = '\n'.join(lines)
         compact = re.sub(r'[^0-9]', '', raw_text)
 
-        # Vietnamese CCCD number: exactly 12 digits. Prefer a standalone 12-digit match.
         number_matches = re.findall(r'(?<!\d)(?:\d[ .-]?){12}(?!\d)', raw_text)
         cccd_number = None
         if number_matches:
@@ -84,7 +117,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
         date_matches = re.findall(r'(?<!\d)(\d{1,2})[/. -](\d{1,2})[/. -](\d{4})(?!\d)', raw_text)
         dates = [f'{int(d):02d}/{int(m):02d}/{y}' for d, m, y in date_matches]
 
-        # Keep parsing conservative: only assign a name when a likely label exists.
         full_name = None
         for i, line in enumerate(lines):
             upper = line.upper()
@@ -96,8 +128,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
                     full_name = candidate
                 break
 
-        # The order on Vietnamese CCCD is commonly: DOB, sex, nationality, birthplace/residence.
-        # We expose OCR lines too, so uncertain fields are never fabricated.
         fields = {
             'cccdNumber': cccd_number,
             'fullName': full_name,
@@ -130,36 +160,37 @@ def classify_and_recognize(image: np.ndarray, requested_type: str) -> dict[str, 
     if mode not in {'auto', 'plate', 'cccd'}:
         raise HTTPException(status_code=400, detail='type must be auto, plate, or cccd')
 
-    if mode in {'auto', 'plate'}:
-        plate_result = detect(image)
-        if plate_result.get('licensePlate'):
+    # For AUTO, check document OCR first. A CCCD request therefore never
+    # needs to load the YOLO plate model, which is the key Railway memory fix.
+    if mode in {'auto', 'cccd'}:
+        cccd_result = _ocr_document(image)
+        if cccd_result.get('documentType') == 'cccd':
             return {
                 'success': True,
-                'type': 'plate',
-                'result': plate_result,
+                'type': 'cccd',
+                'result': cccd_result,
             }
-        if mode == 'plate':
+        if mode == 'cccd':
             return {
                 'success': False,
-                'type': 'plate',
-                'result': plate_result,
+                'type': 'cccd',
+                'result': cccd_result,
             }
 
-    cccd_result = _ocr_document(image)
-    if cccd_result.get('documentType') == 'cccd':
-        return {
-            'success': True,
-            'type': 'cccd',
-            'result': cccd_result,
-        }
-
+    plate_result = _lazy_detect(image)
     return {
-        'success': False,
-        'type': 'unknown',
-        'result': {
-            'plate': plate_result if mode == 'auto' else None,
-            'cccd': cccd_result,
-        },
+        'success': bool(plate_result.get('licensePlate')),
+        'type': 'plate',
+        'result': plate_result,
+    }
+
+
+@app.get('/memory')
+def memory_status():
+    return {
+        'model_loaded': main_module.model is not None,
+        'ocr_loaded': main_module.ocr is not None,
+        'model_path': main_module.MODEL_PATH,
     }
 
 
