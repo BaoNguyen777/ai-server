@@ -1,29 +1,17 @@
 import os
-import re
 import gc
 import threading
 from typing import Any
 
-import cv2
 import numpy as np
 from fastapi import Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 import main as main_module
-from main import (
-    app,
-    auth,
-    get_ocr,
-    read_image,
-    resize_max_side,
-    _json_from_result,
-    trim_native_memory,
-)
+from main import app, auth, read_image, trim_native_memory
 
-# Keep document OCR below the large images commonly produced by phones.
-# This is deliberately conservative because Railway's small instances can
-# otherwise be killed when PaddleOCR and YOLO are resident at the same time.
-CCCD_MAX_SIDE = int(os.getenv("CCCD_OCR_MAX_SIDE", "1200"))
+# Railway memory-safe plate-only inference.
+# CCCD/document OCR has intentionally been removed from this service.
 _model_lock = threading.Lock()
 _inference_lock = threading.Lock()
 _original_detect = main_module.detect
@@ -37,12 +25,7 @@ except Exception as exc:
 
 @app.middleware("http")
 async def ai_concurrency_guard(request, call_next):
-    """Allow only one /api/ai inference per process.
-
-    Railway can send several uploads at once. YOLO + PaddleOCR are memory-heavy,
-    so queuing several inference requests is unsafe on a small container. Return
-    429 immediately instead; Web1 can retry the image instead of causing an OOM.
-    """
+    """Allow only one memory-heavy AI inference per process."""
     if request.url.path != "/api/ai":
         return await call_next(request)
 
@@ -78,12 +61,9 @@ def _ensure_yolo():
 
 
 def _release_yolo():
-    """Release the detector before document OCR on memory-constrained hosts."""
     try:
         with _model_lock:
-            if main_module.model is not None:
-                print("[MEMORY] releasing YOLO before CCCD OCR", flush=True)
-                main_module.model = None
+            main_module.model = None
         gc.collect()
         trim_native_memory()
     except Exception as exc:
@@ -94,131 +74,52 @@ def _lazy_detect(image: np.ndarray) -> dict[str, Any]:
     _ensure_yolo()
     return _original_detect(image)
 
+
 main_module.detect = _lazy_detect
 
 
-def _clean_text(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+def _resize_plate_crop_memory_safe(crop: np.ndarray) -> np.ndarray:
+    """Hard cap OCR input so a motorcycle bbox cannot create a huge OCR tensor."""
+    if crop is None or crop.size == 0:
+        return crop
+
+    max_side = max(1, int(os.getenv("PLATE_OCR_SAFE_MAX_SIDE", "640")))
+    h, w = crop.shape[:2]
+    current = max(h, w)
+    if current <= max_side:
+        return crop
+
+    scale = max_side / current
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    print(f"[MEMORY] plate crop cap: {w}x{h} -> {nw}x{nh}", flush=True)
+    import cv2
+    return cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
-def _ocr_document(image: np.ndarray) -> dict[str, Any]:
-    pipeline = get_ocr()
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="PaddleOCR is unavailable")
-
-    image_for_ocr = resize_max_side(image, CCCD_MAX_SIDE, "cccd")
-    result = None
+def _safe_recognize_plate_crop(crop: np.ndarray):
+    safe_crop = _resize_plate_crop_memory_safe(crop)
     try:
-        print(f"[CCCD] OCR start shape={image_for_ocr.shape}", flush=True)
-        result = pipeline.predict(image_for_ocr)
-        items: list[dict[str, Any]] = []
-        for item in result:
-            data = _json_from_result(item)
-            if not isinstance(data, dict):
-                continue
-            texts = data.get("rec_texts", []) or []
-            scores = data.get("rec_scores", []) or []
-            polys = data.get("rec_polys", []) or data.get("dt_polys", []) or []
-            for i, text in enumerate(texts):
-                text = _clean_text(text)
-                if not text:
-                    continue
-                try:
-                    score = float(scores[i]) if i < len(scores) else 0.0
-                except Exception:
-                    score = 0.0
-                cx = cy = 0.0
-                if i < len(polys):
-                    try:
-                        points = np.asarray(polys[i], dtype=float).reshape(-1, 2)
-                        cx = float(points[:, 0].mean())
-                        cy = float(points[:, 1].mean())
-                    except Exception:
-                        pass
-                items.append({"text": text, "confidence": score, "cx": cx, "cy": cy})
-
-        items.sort(key=lambda x: (x["cy"], x["cx"]))
-        lines = [x["text"] for x in items]
-        raw_text = "\n".join(lines)
-        compact = re.sub(r"[^0-9]", "", raw_text)
-
-        number_matches = re.findall(r"(?<!\d)(?:\d[ .-]?){12}(?!\d)", raw_text)
-        cccd_number = None
-        if number_matches:
-            candidate = re.sub(r"\D", "", number_matches[0])
-            if len(candidate) == 12:
-                cccd_number = candidate
-        if cccd_number is None:
-            fallback = re.findall(r"(?<!\d)\d{12}(?!\d)", compact)
-            cccd_number = fallback[0] if fallback else None
-
-        date_matches = re.findall(
-            r"(?<!\d)(\d{1,2})[/. -](\d{1,2})[/. -](\d{4})(?!\d)",
-            raw_text,
-        )
-        dates = [f"{int(d):02d}/{int(m):02d}/{y}" for d, m, y in date_matches]
-
-        full_name = None
-        for i, line in enumerate(lines):
-            upper = line.upper()
-            if any(label in upper for label in ("HỌ VÀ TÊN", "FULL NAME", "HO VA TEN")):
-                candidate = re.sub(
-                    r"^(HỌ\s*VÀ\s*TÊN|HO\s*VA\s*TEN|FULL\s*NAME)\s*[:.-]?\s*",
-                    "",
-                    line,
-                    flags=re.I,
-                ).strip()
-                if not candidate and i + 1 < len(lines):
-                    candidate = lines[i + 1].strip()
-                if candidate:
-                    full_name = candidate
-                break
-
-        fields = {
-            "cccdNumber": cccd_number,
-            "fullName": full_name,
-            "dateOfBirth": dates[0] if dates else None,
-            "otherDates": dates[1:],
-        }
-        confidence_values = [float(x["confidence"]) for x in items if x["confidence"] > 0]
-        confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
-
-        print(f"[CCCD] number={cccd_number} dates={dates} items={len(items)}", flush=True)
-        return {
-            "success": bool(cccd_number or items),
-            "documentType": "cccd" if cccd_number else "unknown",
-            "confidence": round(confidence, 4),
-            "fields": fields,
-            "rawText": raw_text,
-            "ocrItems": items,
-        }
+        return main_module.recognize_plate_crop(safe_crop)
     finally:
-        result = None
-        if image_for_ocr is not image:
-            del image_for_ocr
+        if safe_crop is not crop:
+            del safe_crop
         gc.collect()
         trim_native_memory()
 
 
-def _enhance_motorcycle_crop(crop: np.ndarray) -> np.ndarray:
-    if crop is None or crop.size == 0:
-        return crop
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
-
 def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
-    """Plate inference optimized for Vietnamese motorcycle two-line plates."""
+    """Single-pass, memory-safe YOLO + PaddleOCR plate inference."""
     model = _ensure_yolo()
     print("[DETECT+] YOLO predict start", flush=True)
+
     results = model.predict(
         image,
         conf=max(0.18, float(os.getenv("YOLO_CONF", "0.25"))),
-        imgsz=int(os.getenv("YOLO_IMGSZ", "768")),
+        imgsz=int(os.getenv("YOLO_IMGSZ", "640")),
         verbose=False,
     )
+
     result = results[0]
     boxes = result.boxes
     detections: list[dict[str, Any]] = []
@@ -240,62 +141,48 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
                 "aspect": round(aspect, 3),
                 "motorcycleShape": aspect < 1.9,
             })
-    try:
-        del boxes
-        del result
-        del results
-    except Exception:
-        pass
+
+    del boxes, result, results, model
     gc.collect()
     trim_native_memory()
 
+    if not detections:
+        print("[DETECT+] no YOLO detections", flush=True)
+        return {
+            "success": False,
+            "licensePlate": None,
+            "confidence": 0.0,
+            "plateConfidence": 0.0,
+            "detections": [],
+        }
+
+    # One OCR attempt is enough for the normal path. This prevents multiple
+    # PaddleOCR tensors from accumulating on small Railway containers.
     ranked = sorted(
-        enumerate(detections),
-        key=lambda pair: (
-            1 if pair[1]["motorcycleShape"] else 0,
-            float(pair[1]["confidence"]),
+        detections,
+        key=lambda d: (
+            1 if d["motorcycleShape"] else 0,
+            float(d["confidence"]),
         ),
         reverse=True,
     )
+    detection = ranked[0]
 
-    max_attempts = max(1, int(os.getenv("MAX_PLATE_OCR_ATTEMPTS", "2")))
-    candidates: list[dict[str, Any]] = []
-    for attempt, (_, detection) in enumerate(ranked[:max_attempts]):
-        print(
-            f"[DETECT+] OCR attempt={attempt + 1}/{max_attempts} conf={detection['confidence']} aspect={detection['aspect']}",
-            flush=True,
-        )
-        crop = main_module.crop_plate(image, detection["box"])
-        try:
-            plate, ocr_conf, parsed = main_module.recognize_plate_crop(crop)
-            if not plate and detection["motorcycleShape"]:
-                enhanced = _enhance_motorcycle_crop(crop)
-                try:
-                    alt_plate, alt_conf, alt_parsed = main_module.recognize_plate_crop(enhanced)
-                finally:
-                    del enhanced
-                if alt_plate and alt_conf >= ocr_conf:
-                    plate, ocr_conf, parsed = alt_plate, alt_conf, alt_parsed
+    print(
+        f"[DETECT+] OCR attempt=1/1 conf={detection['confidence']} aspect={detection['aspect']}",
+        flush=True,
+    )
 
-            if plate:
-                score = float(ocr_conf) * 0.70 + float(detection["confidence"]) * 0.30
-                if detection["motorcycleShape"] and "-" in plate:
-                    score += 0.08
-                candidates.append({
-                    "plate": plate.strip(),
-                    "ocrConfidence": float(ocr_conf),
-                    "yoloConfidence": float(detection["confidence"]),
-                    "score": score,
-                    "detection": detection,
-                    "parsed": parsed,
-                })
-        finally:
-            del crop
-            gc.collect()
-            trim_native_memory()
+    crop = main_module.crop_plate(image, detection["box"])
+    try:
+        plate, ocr_conf, parsed = _safe_recognize_plate_crop(crop)
+    finally:
+        del crop
+        gc.collect()
+        trim_native_memory()
 
-    if not candidates:
-        print("[DETECT+] no valid Vietnamese plate from YOLO crops", flush=True)
+    if not plate:
+        print("[DETECT+] no valid Vietnamese plate from YOLO crop", flush=True)
         return {
             "success": False,
             "licensePlate": None,
@@ -304,68 +191,38 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
             "detections": detections,
         }
 
-    best = max(candidates, key=lambda item: item["score"])
+    score = float(ocr_conf) * 0.70 + float(detection["confidence"]) * 0.30
+    if detection["motorcycleShape"] and "-" in plate:
+        score += 0.08
+
     print(
-        f"[DETECT+] selected plate={best['plate']} score={best['score']:.4f} candidates={[(x['plate'], round(x['score'], 4)) for x in candidates]}",
+        f"[DETECT+] selected plate={plate} score={score:.4f}",
         flush=True,
     )
+
     return {
         "success": True,
-        "licensePlate": best["plate"],
-        "confidence": best["yoloConfidence"],
-        "plateConfidence": best["ocrConfidence"],
+        "licensePlate": plate.strip(),
+        "confidence": detection["confidence"],
+        "plateConfidence": float(ocr_conf),
         "detections": detections,
-        "candidateScores": [
-            {
-                "plate": item["plate"],
-                "score": round(item["score"], 4),
-                "ocrConfidence": round(item["ocrConfidence"], 4),
-                "yoloConfidence": round(item["yoloConfidence"], 4),
-            }
-            for item in candidates
-        ],
+        "candidateScores": [{
+            "plate": plate.strip(),
+            "score": round(score, 4),
+            "ocrConfidence": round(float(ocr_conf), 4),
+            "yoloConfidence": round(float(detection["confidence"]), 4),
+        }],
     }
 
 
-def classify_and_recognize(image: np.ndarray, requested_type: str) -> dict[str, Any]:
-    mode = requested_type.strip().lower() if requested_type else "auto"
-    if mode not in {"auto", "plate", "cccd"}:
-        raise HTTPException(status_code=400, detail="type must be auto, plate, or cccd")
-
-    # Explicit CCCD requests never load YOLO. This prevents both large ML
-    # runtimes from being resident simultaneously on small Railway instances.
-    if mode == "cccd":
-        cccd_result = _ocr_document(image)
-        return {
-            "success": bool(cccd_result.get("documentType") == "cccd"),
-            "type": "cccd",
-            "result": cccd_result,
-        }
-
-    # Plate is the cheap/default path. For `auto`, only start document OCR
-    # after plate recognition fails. This avoids loading PaddleOCR for every
-    # vehicle image and is the main fix for the observed request-time crash.
+def classify_and_recognize(image: np.ndarray, requested_type: str = "plate") -> dict[str, Any]:
+    # CCCD has intentionally been removed. Keep `type` accepted for Web1
+    # compatibility, but every request is plate-only.
     plate_result = _improved_plate_detect(image)
-    if mode == "plate" or plate_result.get("licensePlate"):
-        return {
-            "success": bool(plate_result.get("licensePlate")),
-            "type": "plate",
-            "result": plate_result,
-        }
-
-    # No plate found: release YOLO before loading PaddleOCR for CCCD detection.
-    _release_yolo()
-    cccd_result = _ocr_document(image)
-    if cccd_result.get("documentType") == "cccd":
-        return {"success": True, "type": "cccd", "result": cccd_result}
-
     return {
-        "success": False,
-        "type": "unknown",
-        "result": {
-            "plate": plate_result,
-            "cccd": cccd_result,
-        },
+        "success": bool(plate_result.get("licensePlate")),
+        "type": "plate",
+        "result": plate_result,
     }
 
 
@@ -375,18 +232,21 @@ def memory_status():
         "model_loaded": main_module.model is not None,
         "ocr_loaded": main_module.ocr is not None,
         "model_path": main_module.MODEL_PATH,
+        "mode": "plate-only",
+        "max_concurrent_inference": 1,
     }
 
 
 @app.post("/api/ai", dependencies=[Depends(auth)])
 async def unified_ai(
     file: UploadFile = File(...),
-    type: str = "auto",
+    type: str = "plate",
 ):
-    print(f"[AI] request filename={file.filename} type={type}", flush=True)
+    print(f"[AI] request filename={file.filename} type={type} mode=plate-only", flush=True)
     data = await file.read()
     image = read_image(data)
     del data
+
     try:
         response = classify_and_recognize(image, type)
         print(
@@ -398,3 +258,4 @@ async def unified_ai(
         del image
         gc.collect()
         trim_native_memory()
+        _release_yolo()
