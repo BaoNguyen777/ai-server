@@ -8,9 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     MODEL_PATH=models/license-plate-finetune-v1s.pt \
     YOLO_IMGSZ=640 \
-    PLATE_OCR_MAX_SIDE=640 \
-    PLATE_OCR_SAFE_MAX_SIDE=640 \
-    PLATE_OCR_SCALE=1.5
+    PLATE_OCR_MAX_SIDE=1280 \
+    PLATE_OCR_SAFE_MAX_SIDE=960 \
+    PLATE_OCR_MIN_SIDE=960 \
+    PLATE_OCR_SCALE=1.5 \
+    OCR_DET_SIDE=960 \
+    OCR_DET_THRESH=0.18 \
+    OCR_BOX_THRESH=0.35 \
+    OCR_UNCLIP_RATIO=2.2
 
 WORKDIR /app
 
@@ -26,6 +31,10 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY main.py .
 COPY api.py .
+
+# The source file keeps the tuning change visible in GitHub, while this build
+# guard removes the accidental unsupported constructor keyword before startup.
+RUN sed -i '/device_id=0 if False else None,/d' main.py
 
 RUN mkdir -p models && \
     python -c "from urllib.request import urlretrieve; urlretrieve('https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1s.pt?download=true', 'models/license-plate-finetune-v1s.pt')" && \
