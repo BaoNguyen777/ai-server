@@ -23,8 +23,6 @@ CCCD_MAX_SIDE = int(os.getenv('CCCD_OCR_MAX_SIDE', '1600'))
 _model_lock = threading.Lock()
 _original_detect = main_module.detect
 
-# main.py eagerly loaded YOLO during startup. Remove that handler so Railway
-# can boot with OCR/CPU dependencies without allocating the YOLO weights.
 try:
     if main_module.startup in app.router.on_startup:
         app.router.on_startup.remove(main_module.startup)
@@ -48,7 +46,6 @@ def _lazy_detect(image: np.ndarray) -> dict[str, Any]:
     _ensure_yolo()
     return _original_detect(image)
 
-# Existing /recognize routes in main.py resolve detect through main's globals.
 main_module.detect = _lazy_detect
 
 
@@ -147,13 +144,136 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
         trim_native_memory()
 
 
+def _enhance_motorcycle_crop(crop: np.ndarray) -> np.ndarray:
+    if crop is None or crop.size == 0:
+        return crop
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
+def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
+    """Plate inference optimized for Vietnamese motorcycle two-line plates.
+
+    The existing detector often chooses the highest-confidence crop. For a
+    motorcycle image that can be the wrong rectangle. Here we rank portrait
+    plate boxes first, try several candidates, and only run a lightweight
+    enhancement retry when the first OCR pass fails.
+    """
+    model = _ensure_yolo()
+    print('[DETECT+] YOLO predict start', flush=True)
+    results = model.predict(
+        image,
+        conf=max(0.18, float(os.getenv('YOLO_CONF', '0.25'))),
+        imgsz=int(os.getenv('YOLO_IMGSZ', '960')),
+        verbose=False,
+    )
+    result = results[0]
+    boxes = result.boxes
+    detections: list[dict[str, Any]] = []
+
+    if boxes is not None and len(boxes) > 0:
+        confs = boxes.conf.cpu().numpy().tolist()
+        xyxy = boxes.xyxy.cpu().numpy().tolist()
+        classes = boxes.cls.cpu().numpy().tolist()
+        for box, conf, cls in zip(xyxy, confs, classes):
+            x1, y1, x2, y2 = [float(v) for v in box]
+            width = max(x2 - x1, 1.0)
+            height = max(y2 - y1, 1.0)
+            aspect = width / height
+            class_name = str(result.names.get(int(cls), cls)) if hasattr(result, 'names') and isinstance(result.names, dict) else str(cls)
+            detections.append({
+                'box': [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                'confidence': round(float(conf), 4),
+                'class': class_name,
+                'aspect': round(aspect, 3),
+                'motorcycleShape': aspect < 1.9,
+            })
+    try:
+        del boxes
+        del result
+        del results
+    except Exception:
+        pass
+    gc.collect()
+    trim_native_memory()
+
+    # Portrait/near-square plates are much more likely to be motorcycle plates.
+    ranked = sorted(
+        enumerate(detections),
+        key=lambda pair: (
+            1 if pair[1]['motorcycleShape'] else 0,
+            float(pair[1]['confidence']),
+        ),
+        reverse=True,
+    )
+
+    max_attempts = max(1, int(os.getenv('MAX_PLATE_OCR_ATTEMPTS', '3')))
+    candidates: list[dict[str, Any]] = []
+    for attempt, (index, detection) in enumerate(ranked[:max_attempts]):
+        print(f"[DETECT+] OCR attempt={attempt + 1}/{max_attempts} conf={detection['confidence']} aspect={detection['aspect']}", flush=True)
+        crop = main_module.crop_plate(image, detection['box'])
+        try:
+            plate, ocr_conf, parsed = main_module.recognize_plate_crop(crop)
+            if not plate:
+                # Motorcycle plates are small and often have uneven lighting.
+                if detection['motorcycleShape']:
+                    enhanced = _enhance_motorcycle_crop(crop)
+                    try:
+                        alt_plate, alt_conf, alt_parsed = main_module.recognize_plate_crop(enhanced)
+                    finally:
+                        del enhanced
+                    if alt_plate and alt_conf >= ocr_conf:
+                        plate, ocr_conf, parsed = alt_plate, alt_conf, alt_parsed
+
+            if plate:
+                score = float(ocr_conf) * 0.70 + float(detection['confidence']) * 0.30
+                if detection['motorcycleShape'] and '-' in plate:
+                    score += 0.08
+                candidates.append({
+                    'plate': plate.strip(),
+                    'ocrConfidence': float(ocr_conf),
+                    'yoloConfidence': float(detection['confidence']),
+                    'score': score,
+                    'detection': detection,
+                    'parsed': parsed,
+                })
+        finally:
+            del crop
+            gc.collect()
+            trim_native_memory()
+
+    if not candidates:
+        print('[DETECT+] no valid Vietnamese plate from YOLO crops', flush=True)
+        return {
+            'success': False,
+            'licensePlate': None,
+            'confidence': 0.0,
+            'plateConfidence': 0.0,
+            'detections': detections,
+        }
+
+    best = max(candidates, key=lambda item: item['score'])
+    print(f"[DETECT+] selected plate={best['plate']} score={best['score']:.4f} candidates={[(x['plate'], round(x['score'], 4)) for x in candidates]}", flush=True)
+    return {
+        'success': True,
+        'licensePlate': best['plate'],
+        'confidence': best['yoloConfidence'],
+        'plateConfidence': best['ocrConfidence'],
+        'detections': detections,
+        'candidateScores': [
+            {'plate': item['plate'], 'score': round(item['score'], 4), 'ocrConfidence': round(item['ocrConfidence'], 4), 'yoloConfidence': round(item['yoloConfidence'], 4)}
+            for item in candidates
+        ],
+    }
+
+
 def classify_and_recognize(image: np.ndarray, requested_type: str) -> dict[str, Any]:
     mode = requested_type.strip().lower() if requested_type else 'auto'
     if mode not in {'auto', 'plate', 'cccd'}:
         raise HTTPException(status_code=400, detail='type must be auto, plate, or cccd')
 
-    # OCR first. A CCCD/auto request does not allocate YOLO unless OCR fails
-    # to find a 12-digit CCCD number.
     if mode in {'auto', 'cccd'}:
         cccd_result = _ocr_document(image)
         if cccd_result.get('documentType') == 'cccd':
@@ -161,7 +281,7 @@ def classify_and_recognize(image: np.ndarray, requested_type: str) -> dict[str, 
         if mode == 'cccd':
             return {'success': False, 'type': 'cccd', 'result': cccd_result}
 
-    plate_result = _lazy_detect(image)
+    plate_result = _improved_plate_detect(image)
     return {
         'success': bool(plate_result.get('licensePlate')),
         'type': 'plate',
