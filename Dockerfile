@@ -6,7 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     YOLO_CONFIG_DIR=/tmp/Ultralytics \
     PADDLEX_HOME=/tmp/paddlex \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-    MODEL_PATH=models/license-plate-finetune-v1s.pt
+    MODEL_PATH=models/license-plate-finetune-v1s.pt \
+    YOLO_IMGSZ=640 \
+    PLATE_OCR_MAX_SIDE=640 \
+    PLATE_OCR_SAFE_MAX_SIDE=640 \
+    PLATE_OCR_SCALE=1.5
 
 WORKDIR /app
 
@@ -23,15 +27,11 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY main.py .
 COPY api.py .
 
-# MorseTechLab YOLOv11 license-plate detector (v1s, 37.8 MB).
-# v1s is selected as the Railway-friendly variant; the model repository also
-# provides larger n/m/l/x variants when more RAM is available.
 RUN mkdir -p models && \
     python -c "from urllib.request import urlretrieve; urlretrieve('https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/license-plate-finetune-v1s.pt?download=true', 'models/license-plate-finetune-v1s.pt')" && \
     ln -s license-plate-finetune-v1s.pt models/best.pt
 
 EXPOSE 8000
 
-# IMPORTANT: keep exactly one worker. Each worker would load its own
-# YOLO/PaddleOCR runtime and multiply RAM usage on a small Railway service.
+# Exactly one worker: one YOLO/PaddleOCR runtime only.
 CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
