@@ -21,10 +21,10 @@ from main import (
 
 CCCD_MAX_SIDE = int(os.getenv('CCCD_OCR_MAX_SIDE', '1600'))
 _model_lock = threading.Lock()
+_original_detect = main_module.detect
 
-# IMPORTANT: main.py used to load YOLO during startup. That made Railway
-# load YOLO before a request even arrived, while PaddleOCR was also imported.
-# Remove that eager startup handler and load YOLO only for plate requests.
+# main.py eagerly loaded YOLO during startup. Remove that handler so Railway
+# can boot with OCR/CPU dependencies without allocating the YOLO weights.
 try:
     if main_module.startup in app.router.on_startup:
         app.router.on_startup.remove(main_module.startup)
@@ -35,7 +35,6 @@ except Exception as exc:
 def _ensure_yolo():
     if main_module.model is not None:
         return main_module.model
-
     with _model_lock:
         if main_module.model is None:
             from ultralytics import YOLO
@@ -47,10 +46,9 @@ def _ensure_yolo():
 
 def _lazy_detect(image: np.ndarray) -> dict[str, Any]:
     _ensure_yolo()
-    return main_module.detect(image)
+    return _original_detect(image)
 
-# Existing /recognize and /recognize/batch routes in main.py resolve detect
-# through main's globals, so replacing the module reference preserves them.
+# Existing /recognize routes in main.py resolve detect through main's globals.
 main_module.detect = _lazy_detect
 
 
@@ -68,17 +66,14 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
     try:
         print(f'[CCCD] OCR start shape={image_for_ocr.shape}', flush=True)
         result = pipeline.predict(image_for_ocr)
-
         items: list[dict[str, Any]] = []
         for item in result:
             data = _json_from_result(item)
             if not isinstance(data, dict):
                 continue
-
             texts = data.get('rec_texts', []) or []
             scores = data.get('rec_scores', []) or []
             polys = data.get('rec_polys', []) or data.get('dt_polys', []) or []
-
             for i, text in enumerate(texts):
                 text = _clean_text(text)
                 if not text:
@@ -87,7 +82,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
                     score = float(scores[i]) if i < len(scores) else 0.0
                 except Exception:
                     score = 0.0
-
                 cx = cy = 0.0
                 if i < len(polys):
                     try:
@@ -96,7 +90,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
                         cy = float(points[:, 1].mean())
                     except Exception:
                         pass
-
                 items.append({'text': text, 'confidence': score, 'cx': cx, 'cy': cy})
 
         items.sort(key=lambda x: (x['cy'], x['cx']))
@@ -134,7 +127,6 @@ def _ocr_document(image: np.ndarray) -> dict[str, Any]:
             'dateOfBirth': dates[0] if dates else None,
             'otherDates': dates[1:],
         }
-
         confidence_values = [float(x['confidence']) for x in items if x['confidence'] > 0]
         confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
 
@@ -160,22 +152,14 @@ def classify_and_recognize(image: np.ndarray, requested_type: str) -> dict[str, 
     if mode not in {'auto', 'plate', 'cccd'}:
         raise HTTPException(status_code=400, detail='type must be auto, plate, or cccd')
 
-    # For AUTO, check document OCR first. A CCCD request therefore never
-    # needs to load the YOLO plate model, which is the key Railway memory fix.
+    # OCR first. A CCCD/auto request does not allocate YOLO unless OCR fails
+    # to find a 12-digit CCCD number.
     if mode in {'auto', 'cccd'}:
         cccd_result = _ocr_document(image)
         if cccd_result.get('documentType') == 'cccd':
-            return {
-                'success': True,
-                'type': 'cccd',
-                'result': cccd_result,
-            }
+            return {'success': True, 'type': 'cccd', 'result': cccd_result}
         if mode == 'cccd':
-            return {
-                'success': False,
-                'type': 'cccd',
-                'result': cccd_result,
-            }
+            return {'success': False, 'type': 'cccd', 'result': cccd_result}
 
     plate_result = _lazy_detect(image)
     return {
