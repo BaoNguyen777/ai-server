@@ -32,9 +32,6 @@ async def ai_concurrency_guard(request, call_next):
     if request.url.path != "/api/ai":
         return await call_next(request)
 
-    # Wait asynchronously instead of returning 429. Middleware runs before
-    # FastAPI parses the multipart body, so queued uploads do not become large
-    # in-memory image tensors while they wait for the inference slot.
     while not _inference_lock.acquire(blocking=False):
         await asyncio.sleep(0.05)
 
@@ -77,12 +74,7 @@ main_module.detect = _lazy_detect
 
 
 def _plate_candidates_with_ocr_ambiguity(text: str) -> list[str]:
-    """Handle common OCR confusion where the series letter is read as a digit.
-
-    Example: OCR `30845864` -> `30B45864` -> formatted as `30B-458.64`.
-    The substitution is only considered at the Vietnamese series-letter
-    position (after the first two digits), avoiding broad false replacements.
-    """
+    """Handle common OCR confusion where the series letter is read as a digit."""
     candidates = list(_original_plate_candidates(text))
     raw = main_module.clean_alnum(text)
 
@@ -104,8 +96,26 @@ def _plate_candidates_with_ocr_ambiguity(text: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-# recognize_plate_crop resolves plate_candidates from main.py's module globals.
 main_module.plate_candidates = _plate_candidates_with_ocr_ambiguity
+
+
+def _resize_input_for_detection(image: np.ndarray) -> np.ndarray:
+    """Resize the detection copy so its longest side is at most 640px."""
+    if image is None or image.size == 0:
+        return image
+
+    max_side = max(1, int(os.getenv("AI_INPUT_MAX_SIDE", "640")))
+    h, w = image.shape[:2]
+    current = max(h, w)
+    if current <= max_side:
+        return image
+
+    import cv2
+    scale = max_side / current
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    print(f"[MEMORY] AI input resize: {w}x{h} -> {nw}x{nh}", flush=True)
+    return cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
 def _resize_plate_crop_memory_safe(crop: np.ndarray) -> np.ndarray:
@@ -150,11 +160,12 @@ def _safe_recognize_plate_crop(crop: np.ndarray):
 
 def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
     """Single-pass, memory-safe YOLO + PaddleOCR plate inference."""
+    detect_image = _resize_input_for_detection(image)
     model = _ensure_yolo()
     print("[DETECT+] YOLO predict start", flush=True)
 
     results = model.predict(
-        image,
+        detect_image,
         conf=max(0.18, float(os.getenv("YOLO_CONF", "0.25"))),
         imgsz=int(os.getenv("YOLO_IMGSZ", "640")),
         verbose=False,
@@ -183,6 +194,8 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
             })
 
     del boxes, result, results, model
+    if detect_image is not image:
+        del detect_image
     gc.collect()
     trim_native_memory()
 
@@ -248,8 +261,6 @@ def _improved_plate_detect(image: np.ndarray) -> dict[str, Any]:
 
 
 def classify_and_recognize(image: np.ndarray, requested_type: str = "plate") -> dict[str, Any]:
-    # CCCD has intentionally been removed. Keep `type` accepted for Web1
-    # compatibility, but every request is plate-only.
     plate_result = _improved_plate_detect(image)
     return {
         "success": bool(plate_result.get("licensePlate")),
@@ -267,6 +278,7 @@ def memory_status():
         "mode": "plate-only",
         "max_concurrent_inference": 1,
         "queue_mode": "wait",
+        "ai_input_max_side": int(os.getenv("AI_INPUT_MAX_SIDE", "640")),
     }
 
 
